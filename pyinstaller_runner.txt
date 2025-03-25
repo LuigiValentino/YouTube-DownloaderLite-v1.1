@@ -1,0 +1,1 @@
+pyinstaller --onefile --noconsole --icon=./source/icon16.png --name=YouTube DownloaderLite v1.1 --clean --upx-exclude=* main.py
