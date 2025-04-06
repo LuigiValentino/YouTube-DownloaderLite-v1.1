@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLineEdit, QFileDialog, QLabel, QMessageBox, QTableWidget,
     QTableWidgetItem, QProgressBar, QRadioButton, QButtonGroup, QGroupBox
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QFile, QTextStream
+from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot, Qt, QFile, QTextStream
 from PyQt5.QtGui import QIcon
 from pytubefix import YouTube, Playlist 
 
@@ -22,32 +22,35 @@ def load_stylesheet(app, path="style.qss"):
     else:
         print(f"No se pudo cargar el archivo de estilos: {path}")
 
-class DownloadThread(QThread):
+class WorkerSignals(QObject):
     progress_msg = pyqtSignal(str, int)
     progress_value = pyqtSignal(int, int)
     finished_download = pyqtSignal(int)
 
+class DownloadWorker(QRunnable):
     def __init__(self, url, path, row, fmt):
         super().__init__()
         self.url = url
         self.path = path
         self.row = row
         self.fmt = fmt  
+        self.signals = WorkerSignals()
 
     def on_progress(self, stream, chunk, bytes_remaining):
         try:
             total = stream.filesize
             progress_percent = int((total - bytes_remaining) / total * 100)
-            self.progress_value.emit(progress_percent, self.row)
+            self.signals.progress_value.emit(progress_percent, self.row)
         except Exception as e:
             logging.error(f"Error en on_progress: {e}")
 
+    @pyqtSlot()
     def run(self):
         try:
             yt = YouTube(self.url, on_progress_callback=self.on_progress)
             title = yt.title
             logging.info(f"Iniciando descarga: {title}")
-            self.progress_msg.emit(f"Iniciando: {title}", self.row)
+            self.signals.progress_msg.emit(f"Iniciando: {title}", self.row)
             if self.fmt == 'mp4':
                 stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
                 if stream is None:
@@ -61,14 +64,13 @@ class DownloadThread(QThread):
                 base, _ = os.path.splitext(out_file)
                 new_file = base + ".mp3"
                 os.rename(out_file, new_file)
-            self.progress_msg.emit(f"Completado: {title}", self.row)
+            self.signals.progress_msg.emit(f"Completado: {title}", self.row)
             logging.info(f"Descarga completada: {title}")
         except Exception as e:
-            self.progress_msg.emit(f"Error: {str(e)}", self.row)
+            self.signals.progress_msg.emit(f"Error: {str(e)}", self.row)
             logging.error(f"Error en descarga {self.url}: {e}")
-            QMessageBox.critical(None, "Error en descarga", f"Error con la URL:\n{self.url}\n{str(e)}")
         finally:
-            self.finished_download.emit(self.row)
+            self.signals.finished_download.emit(self.row)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -80,8 +82,8 @@ class MainWindow(QMainWindow):
         self.download_queue = []  
         self.total_downloads = 0
         self.completed_downloads = 0
-        self.active_threads = {}
-        self.max_concurrent = 3
+        self.threadpool = QThreadPool()
+        self.cancel_requested = False
         self.init_ui()
 
         self.statusBar().showMessage("Programa hecho por Luigi Adducci")
@@ -205,27 +207,17 @@ class MainWindow(QMainWindow):
         self.completed_downloads = 0
         self.info_label.setText(f"Iniciando descarga: 0 de {self.total_downloads}")
         self.start_button.setEnabled(False)
-        for _ in range(min(self.max_concurrent, len(self.download_queue))):
-            self.process_next_download()
+        self.cancel_requested = False
 
-    def process_next_download(self):
-        if self.download_queue:
-            if len(self.active_threads) >= self.max_concurrent:
-                return
-            url, row = self.download_queue.pop(0)
-            self.table.setItem(row, 2, QTableWidgetItem("Iniciado"))
+        for url, row in self.download_queue:
+            self.table.setItem(row, 2, QTableWidgetItem("En cola"))
             fmt = 'mp4' if self.mp4_radio.isChecked() else 'mp3'
-            thread = DownloadThread(url, self.download_path, row, fmt)
-            self.active_threads[row] = thread
-            thread.progress_msg.connect(self.update_status)
-            thread.progress_value.connect(self.update_progress_bar)
-            thread.finished_download.connect(self.download_finished)
-            thread.start()
-        else:
-            if not self.active_threads:
-                self.info_label.setText("Todas las descargas han finalizado.")
-                self.global_progress.setValue(100)
-                self.show_completion_dialog()
+            worker = DownloadWorker(url, self.download_path, row, fmt)
+            worker.signals.progress_msg.connect(self.update_status)
+            worker.signals.progress_value.connect(self.update_progress_bar)
+            worker.signals.finished_download.connect(self.download_finished)
+            self.threadpool.start(worker)
+        self.download_queue.clear()
 
     def update_status(self, message, row):
         self.table.setItem(row, 2, QTableWidgetItem(message))
@@ -243,26 +235,24 @@ class MainWindow(QMainWindow):
 
     def download_finished(self, row):
         self.completed_downloads += 1
-        self.info_label.setText(f"Descargando {self.completed_downloads} de {self.total_downloads}")
-        if row in self.active_threads:
-            del self.active_threads[row]
-        self.process_next_download()
+        self.info_label.setText(f"Descargados {self.completed_downloads} de {self.total_downloads}")
+
+        if self.completed_downloads == self.total_downloads:
+            self.info_label.setText("Todas las descargas han finalizado.")
+            self.global_progress.setValue(100)
+            self.show_completion_dialog()
 
     def cancel_all_downloads(self):
-        if self.active_threads:
+        if self.download_queue:
             reply = QMessageBox.question(self, "Cancelar Descargas",
-                                         "¿Cancelar todas las descargas en curso?",
+                                         "¿Cancelar todas las descargas en cola?",
                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
-                for row, thread in list(self.active_threads.items()):
-                    thread.terminate()
-                    thread.wait()
-                    logging.info(f"Descarga cancelada: {thread.url}")
-                    self.table.setItem(row, 2, QTableWidgetItem("Cancelado"))
-                self.active_threads.clear()
-                self.info_label.setText("Descargas canceladas.")
+                self.download_queue.clear()
+                self.info_label.setText("Descargas en cola canceladas.")
+                logging.info("Descargas en cola canceladas por el usuario.")
         else:
-            QMessageBox.information(self, "Sin Descargas", "No hay descargas en curso.")
+            QMessageBox.information(self, "Sin Descargas", "No hay descargas en cola para cancelar.")
 
     def clear_table(self):
         self.table.setRowCount(0)
@@ -286,16 +276,15 @@ class MainWindow(QMainWindow):
 
     def reset_ui(self):
         self.clear_table()
+        self.start_button.setEnabled(True)
 
     def closeEvent(self, event):
-        if self.active_threads:
+        if self.completed_downloads < self.total_downloads:
             reply = QMessageBox.question(self, "Salir",
-                                         "Descargas en curso. ¿Salir y cancelar descargas?",
+                                         "Existen descargas en curso. ¿Desea salir y dejar que se cancelen las tareas en cola?",
                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.Yes:
-                for thread in self.active_threads.values():
-                    thread.terminate()
-                    thread.wait()
+                self.download_queue.clear()
                 event.accept()
             else:
                 event.ignore()
